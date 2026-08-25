@@ -15,8 +15,9 @@ class BaseMultimodalMIMIC4Task(BaseTask):
     task variants (notes, ICD codes, lab values).
     """
 
-    MISSING_TEXT_TOKEN: ClassVar[str] = ""
-    MISSING_CODE_TOKEN: ClassVar[str] = "<missing>"
+    # Placeholder for unobserved lab categories. Only valid together with
+    # labs_mask: True is a real 0.0 measurement, False is imputed. Never
+    # interpret 0.0 as missing without the mask.
     MISSING_FLOAT_TOKEN: ClassVar[float] = 0.0
 
     LAB_CATEGORIES: ClassVar[Dict[str, List[str]]] = {
@@ -95,7 +96,9 @@ class BaseMultimodalMIMIC4Task(BaseTask):
         #    admission-context discharge sections stamped at admit, not
         #    charttime. v3 caches used a 24h class default and discharge
         #    charttime on those notes.
-        self.emitted_data_version = 4
+        # 5: drop patients with no data in any required modality.
+        self.emitted_data_version = 5
+        self.n_dropped_empty = 0
 
     @staticmethod
     def _clean_text(text: Optional[str]) -> Optional[str]:
@@ -189,6 +192,14 @@ class BaseMultimodalMIMIC4Task(BaseTask):
             return admission_dischtime
         end = admission_time + timedelta(hours=self.window_hours)
         return min(end, admission_dischtime) if admission_dischtime else end
+
+    def _drop_empty(self) -> List:
+        self.n_dropped_empty += 1
+        logger.info(
+            "%d patients dropped: no data in any modality",
+            self.n_dropped_empty,
+        )
+        return []
 
     def _build_admissions_to_process(self, patient: Any) -> Tuple[List[Any], int]:
         """Build admissions to process and derive mortality label.
@@ -554,6 +565,9 @@ class NotesLabsMIMIC4(BaseMultimodalMIMIC4Task):
         if self.include_icd:
             record["icd_codes"] = (all_icd_times, all_icd_codes)
 
+        if not all_lab_times and not all_note_texts:
+            return self._drop_empty()
+
         return [record]
 
 
@@ -752,6 +766,9 @@ class NotesLabsCXRMIMIC4(BaseMultimodalMIMIC4Task):
         if self.include_icd:
             record["icd_codes"] = (all_icd_times, all_icd_codes)
 
+        if not all_lab_times and not all_note_texts and not all_cxr_paths:
+            return self._drop_empty()
+
         return [record]
 
 
@@ -831,6 +848,9 @@ class LabsMIMIC4(BaseMultimodalMIMIC4Task):
             "window_start": effective_start,
             "window_end": effective_end,
         }
+
+        if not all_lab_times:
+            return self._drop_empty()
 
         return [single_patient_longitudinal_record]
 
@@ -918,5 +938,8 @@ class CXRMIMIC4(BaseMultimodalMIMIC4Task):
             "window_start": effective_start,
             "window_end": effective_end,
         }
+
+        if not all_cxr_paths:
+            return self._drop_empty()
 
         return [single_patient_longitudinal_record]
