@@ -32,6 +32,8 @@ LR="${LR:-1e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 PATIENCE="${PATIENCE:-5}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+USE_AMP="${USE_AMP:-0}"
+AMP_DTYPE="${AMP_DTYPE:-bf16}"
 
 # Condor GPU cgroups can expose a truncated CUDA_VISIBLE_DEVICES UUID that
 # distributed's NVML diagnostics can't resolve, crashing LocalCluster startup.
@@ -122,6 +124,7 @@ echo "  Cache dir : ${CACHE_DIR}"
 echo "  Output dir: ${OUTPUT_DIR}"
 echo "  Seed      : ${SEED}"
 echo "  Dev mode  : ${DEV_MODE}"
+echo "  Use AMP   : ${USE_AMP} (dtype=${AMP_DTYPE})"
 echo "========================================================"
 
 if ! python -c "import pyhealth" >/dev/null 2>&1; then
@@ -151,6 +154,10 @@ COMMON=(
 
 if [[ "${DEV_MODE}" == "1" ]]; then
     COMMON+=(--dev)
+fi
+
+if [[ "${USE_AMP}" == "1" ]]; then
+    COMMON+=(--use-amp --amp-dtype "${AMP_DTYPE}")
 fi
 
 if [[ "${USE_WANDB}" == "1" ]]; then
