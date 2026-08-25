@@ -1,23 +1,9 @@
-"""Proof that every lab/CXR task honours a per-admission observation window.
+"""The observation window is gone from the multimodal MIMIC-IV tasks.
 
-Four task bodies computed a window from ``window_hours`` and then collected
-labs through discharge. For a mortality label that reads the outcome.
-
-Measured on MIMIC-IV ``labs_only``:
-
-  collection through discharge  PR-AUC 0.6204  ROC 0.90
-  window honoured               PR-AUC 0.2137  ROC 0.7136
-
-A sweep over 24, 48, and 96 hours produced three identical datasets, because
-``window_hours`` was inert. The window also anchored on the patient's first
-admission globally, so a later stay received a span that had already closed.
-
-CXR / ``notes_labs_cxr`` still skipped those later stays with
-``admission_time >= first_admit + window_hours``. That skip is gone.
-``emitted_data_version`` is 4 so caches from version 1-3 cannot be reused.
-The table protocol default is full stay (``window_hours=None``). Passing
-``window_hours=24`` still caps collection per admission; CXR arms must not
-skip later stays against the first admission's clock.
+``window_hours`` used to cap (or claim to cap) collection per admission.
+It is no longer a constructor argument. Collection is the full stay.
+``emitted_data_version`` is 5 so caches from versions 1-4 cannot be reused.
+CXR arms must still not skip later stays against the first admission's clock.
 
 Repro::
 
@@ -31,7 +17,6 @@ import inspect
 import json
 import unittest
 import uuid
-from datetime import datetime, timedelta
 
 
 LAB_TASKS = [
@@ -43,41 +28,12 @@ LAB_TASKS = [
 
 
 class TestP1ObservationWindow(unittest.TestCase):
-    def test_every_task_honours_a_24h_window(self):
+    def test_window_hours_kwarg_is_rejected(self):
         from pyhealth.tasks import multimodal_mimic4 as m
 
-        admit = datetime(2180, 5, 6, 8, 0, 0)
-        discharge = admit + timedelta(days=9)
         for name in LAB_TASKS:
-            task = getattr(m, name)(window_hours=24)
-            end = task._admission_window_end(admit, discharge)
-            horizon = (end - admit).total_seconds() / 3600.0
-            self.assertAlmostEqual(
-                horizon,
-                24.0,
-                places=2,
-                msg=f"{name} collects {horizon:.0f}h past admission",
-            )
-            self.assertLess(end, discharge)
-
-    def test_window_is_anchored_per_admission(self):
-        from pyhealth.tasks import multimodal_mimic4 as m
-
-        first = datetime(2180, 5, 6, 8, 0, 0)
-        later = first + timedelta(days=400)
-        for name in LAB_TASKS:
-            task = getattr(m, name)(window_hours=24)
-            self.assertEqual(
-                task._admission_window_end(first, first + timedelta(days=9)),
-                first + timedelta(hours=24),
-            )
-            self.assertEqual(
-                task._admission_window_end(first, first + timedelta(hours=6)),
-                first + timedelta(hours=6),
-            )
-            end = task._admission_window_end(later, later + timedelta(days=5))
-            self.assertEqual(end, later + timedelta(hours=24))
-            self.assertGreater(end, later, msg=f"{name} expired before later stay")
+            with self.assertRaises(TypeError):
+                getattr(m, name)(window_hours=24)
 
     def test_cxr_arms_do_not_skip_later_stays_on_the_first_admit_clock(self):
         from pyhealth.tasks.multimodal_mimic4 import CXRMIMIC4, NotesLabsCXRMIMIC4
@@ -90,12 +46,12 @@ class TestP1ObservationWindow(unittest.TestCase):
                 msg=f"{cls.__name__} still drops later stays against first admit + window",
             )
 
-    def test_window_change_invalidates_the_cache(self):
-        from pyhealth.tasks import multimodal_mimic4 as m
+    def test_empty_drop_invalidates_the_cache(self):
+        from pyhealth.tasks.multimodal_mimic4 import LabsMIMIC4
 
-        task = m.LabsMIMIC4(window_hours=24)
+        task = LabsMIMIC4()
         self.assertIsNotNone(vars(task).get("emitted_data_version"))
-        self.assertGreaterEqual(task.emitted_data_version, 4)
+        self.assertGreaterEqual(task.emitted_data_version, 5)
 
         def cache_key(t, drop_version=False):
             v = dict(vars(t))
@@ -114,15 +70,7 @@ class TestP1ObservationWindow(unittest.TestCase):
 
         self.assertNotEqual(cache_key(task), cache_key(task, drop_version=True))
 
-    def test_window_none_still_collects_through_discharge(self):
-        from pyhealth.tasks.multimodal_mimic4 import LabsMIMIC4
-
-        task = LabsMIMIC4(window_hours=None)
-        admit = datetime(2180, 5, 6, 8, 0, 0)
-        discharge = admit + timedelta(days=9)
-        self.assertEqual(task._admission_window_end(admit, discharge), discharge)
-
-    def test_protocol_default_is_full_stay(self):
+    def test_protocol_default_has_no_window_hours(self):
         from pyhealth.tasks.multimodal_mimic4 import (
             CXRMIMIC4,
             LabsMIMIC4,
@@ -130,10 +78,13 @@ class TestP1ObservationWindow(unittest.TestCase):
             NotesLabsMIMIC4,
         )
 
-        self.assertIsNone(NotesLabsMIMIC4().window_hours)
-        self.assertIsNone(NotesLabsCXRMIMIC4().window_hours)
-        self.assertIsNone(LabsMIMIC4().window_hours)
-        self.assertIsNone(CXRMIMIC4().window_hours)
+        for task in (
+            NotesLabsMIMIC4(),
+            NotesLabsCXRMIMIC4(),
+            LabsMIMIC4(),
+            CXRMIMIC4(),
+        ):
+            self.assertFalse(hasattr(task, "window_hours"))
 
     def test_discharge_coded_icd_is_not_a_mortality_task(self):
         from pyhealth.tasks import multimodal_mimic4 as m

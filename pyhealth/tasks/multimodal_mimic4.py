@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Union, Tuple, ClassVar
 
 from pyhealth.tasks.base_task import BaseTask
@@ -79,24 +79,20 @@ class BaseMultimodalMIMIC4Task(BaseTask):
         # "review of systems",
     ]
 
-    def __init__(
-        self,
-        window_hours: Optional[float] = None,
-    ):
-        self.window_hours = window_hours
+    def __init__(self):
         # Task cache key is uuid5 over {**vars(task), schemas}. Bump when
         # emitted data changes so leaky caches cannot be reused.
         # 1: empty events instead of placeholders; per-admission collection span.
         # 2: CXR/notes_labs_cxr no longer drop later stays against the first
-        #    admission's clock (admission_time >= first_admit + window_hours).
+        #    admission's clock.
         # 3: event times are hours from the first stay in the sample, not
         #    reset per admission (reset times made stay 2 at +6h sort with
         #    stay 1 at +6h).
-        # 4: class/runner default is full stay (window_hours=None);
-        #    admission-context discharge sections stamped at admit, not
-        #    charttime. v3 caches used a 24h class default and discharge
-        #    charttime on those notes.
-        # 5: drop patients with no data in any required modality.
+        # 4: class/runner default is full stay; admission-context discharge
+        #    sections stamped at admit, not charttime. v3 caches used a 24h
+        #    class default and discharge charttime on those notes.
+        # 5: drop patients with no data in any required modality; observation
+        #    window kwargs removed.
         self.emitted_data_version = 5
         self.n_dropped_empty = 0
 
@@ -141,57 +137,24 @@ class BaseMultimodalMIMIC4Task(BaseTask):
     def _hours_since(cls, timestamp: datetime, origin: datetime) -> float:
         """Hours from ``origin`` to ``timestamp``.
 
-        Collection windows stay per admission (full stay, or admit+window
-        when ``window_hours`` is set). The value written onto the unified
-        timeline is hours from the first stay in this sample, so a later
-        stay at +6h does not sort with the first stay at +6h.
+        Collection is per admission (admit through discharge). Hours written
+        onto the unified timeline are measured from the first stay in this
+        sample, so a later stay at +6h does not sort with the first stay at +6h.
         """
         return cls._to_hours((timestamp - origin).total_seconds())
 
-    def _compute_effective_window(
+    def _stay_span(
         self,
         admissions_to_process: List[Any],
     ) -> Tuple[datetime, Optional[datetime]]:
-        """Compute effective start/end from the global span of processed admissions.
-
-        Returns:
-            Tuple of (effective_start, effective_end).
-        """
-        global_start = admissions_to_process[0].timestamp
-        global_end: Optional[datetime] = None
-
-        for a in admissions_to_process:
-            dt = self._parse_datetime(getattr(a, "dischtime", None))
-            if dt is not None and (global_end is None or dt > global_end):
-                global_end = dt
-
-        if self.window_hours is not None:
-            effective_start = global_start
-            effective_end = effective_start + timedelta(hours=self.window_hours)
-            return effective_start, effective_end
-
-        effective_start = global_start
-        effective_end = global_end
-
-        return effective_start, effective_end
-
-    def _admission_window_end(
-        self,
-        admission_time: datetime,
-        admission_dischtime: datetime,
-    ) -> datetime:
-        """End of the observation window for one admission.
-
-        Callers previously passed ``admission_dischtime`` directly, so
-        ``window_hours`` was inert and labs were collected through discharge.
-        For a mortality label that reads the outcome. Re-anchor per admission
-        and clamp to discharge so a later stay cannot inherit the first
-        admission's window.
-        """
-        if self.window_hours is None:
-            return admission_dischtime
-        end = admission_time + timedelta(hours=self.window_hours)
-        return min(end, admission_dischtime) if admission_dischtime else end
+        """First admit timestamp and latest discharge among processed stays."""
+        start = admissions_to_process[0].timestamp
+        end: Optional[datetime] = None
+        for admission in admissions_to_process:
+            dt = self._parse_datetime(getattr(admission, "dischtime", None))
+            if dt is not None and (end is None or dt > end):
+                end = dt
+        return start, end
 
     def _drop_empty(self) -> List:
         self.n_dropped_empty += 1
@@ -419,9 +382,9 @@ class NotesLabsMIMIC4(BaseMultimodalMIMIC4Task):
         icd_codes: (only when ``include_icd=True``) Diagnosis + procedure codes
             per admission with inter-admission time offsets.
 
+    Collection is the full admission span (admit through discharge).
+
     Args:
-        window_hours: Hours from admission for lab collection. ``None``
-            collects for the full admission span. Default: ``None``.
         include_icd: When ``True``, collect discharge-coded ICD codes and add
             ``icd_codes`` to the sample dict / input schema. Default: ``False``.
             MIMIC-IV timestamps those codes at ``dischtime``, so this leaks
@@ -449,12 +412,8 @@ class NotesLabsMIMIC4(BaseMultimodalMIMIC4Task):
     input_schema: Dict[str, Union[str, Tuple[str, Dict]]] = _BASE_INPUT_SCHEMA
     output_schema: Dict[str, str] = {"mortality": "binary"}
 
-    def __init__(
-        self,
-        window_hours: Optional[float] = None,
-        include_icd: bool = False,
-    ) -> None:
-        super().__init__(window_hours=window_hours)
+    def __init__(self, include_icd: bool = False) -> None:
+        super().__init__()
         self.include_icd = include_icd
         schema = dict(self._BASE_INPUT_SCHEMA)
         if include_icd:
@@ -477,7 +436,7 @@ class NotesLabsMIMIC4(BaseMultimodalMIMIC4Task):
         if not admissions_to_process:
             return []
 
-        effective_start, effective_end = self._compute_effective_window(
+        effective_start, effective_end = self._stay_span(
             admissions_to_process
         )
         time_origin = admissions_to_process[0].timestamp
@@ -515,7 +474,7 @@ class NotesLabsMIMIC4(BaseMultimodalMIMIC4Task):
             all_note_times.extend(note_times)
 
             # Labs within the observation window of THIS admission.
-            lab_end = self._admission_window_end(admission_time, admission_dischtime)
+            lab_end = admission_dischtime
             lab_times, lab_values, lab_masks = self._collect_labs(
                 patient=patient,
                 admission_time=admission_time,
@@ -592,9 +551,9 @@ class NotesLabsCXRMIMIC4(BaseMultimodalMIMIC4Task):
         icd_codes: (only when ``include_icd=True``) Diagnosis + procedure codes
             per admission with inter-admission time offsets.
 
+    Collection is the full admission span (admit through discharge).
+
     Args:
-        window_hours: Hours from admission for lab/CXR collection.
-            ``None`` collects for the full admission span. Default: ``None``.
         include_icd: When ``True``, collect discharge-coded ICD codes and add
             ``icd_codes`` to the sample dict / input schema. Default: ``False``.
             MIMIC-IV timestamps those codes at ``dischtime``, so this leaks
@@ -630,12 +589,8 @@ class NotesLabsCXRMIMIC4(BaseMultimodalMIMIC4Task):
     input_schema: Dict[str, Union[str, Tuple[str, Dict]]] = _BASE_INPUT_SCHEMA
     output_schema: Dict[str, str] = {"mortality": "binary"}
 
-    def __init__(
-        self,
-        window_hours: Optional[float] = None,
-        include_icd: bool = False,
-    ) -> None:
-        super().__init__(window_hours=window_hours)
+    def __init__(self, include_icd: bool = False) -> None:
+        super().__init__()
         self.include_icd = include_icd
         schema = dict(self._BASE_INPUT_SCHEMA)
         if include_icd:
@@ -658,7 +613,7 @@ class NotesLabsCXRMIMIC4(BaseMultimodalMIMIC4Task):
         if not admissions_to_process:
             return []
 
-        effective_start, effective_end = self._compute_effective_window(
+        effective_start, effective_end = self._stay_span(
             admissions_to_process
         )
         time_origin = admissions_to_process[0].timestamp
@@ -698,7 +653,7 @@ class NotesLabsCXRMIMIC4(BaseMultimodalMIMIC4Task):
             all_note_times.extend(note_times)
 
             # Labs within the observation window of THIS admission.
-            lab_end = self._admission_window_end(admission_time, admission_dischtime)
+            lab_end = admission_dischtime
             lab_times, lab_values, lab_masks = self._collect_labs(
                 patient=patient,
                 admission_time=admission_time,
@@ -782,9 +737,7 @@ class LabsMIMIC4(BaseMultimodalMIMIC4Task):
     Schema mirrors the ``labs`` / ``labs_mask`` fields from ``NotesLabsMIMIC4``
     so the same backbone models (MLP, RNN, Transformer, etc.) work unchanged.
 
-    Args:
-        window_hours: Hours from admission to collect lab measurements.
-            ``None`` collects for the full admission span. Default: ``None``.
+    Collection is the full admission span (admit through discharge).
     """
 
     PADDING: int = 0
@@ -797,9 +750,6 @@ class LabsMIMIC4(BaseMultimodalMIMIC4Task):
     }
     output_schema: ClassVar[Dict] = {"mortality": "binary"}
 
-    def __init__(self, window_hours: Optional[float] = None) -> None:
-        super().__init__(window_hours=window_hours)
-
     def __call__(self, patient: Any) -> List[Dict[str, Any]]:  # type: ignore[override]
         admissions_to_process, mortality_label = self._build_admissions_to_process(
             patient
@@ -807,7 +757,7 @@ class LabsMIMIC4(BaseMultimodalMIMIC4Task):
         if not admissions_to_process:
             return []
 
-        effective_start, effective_end = self._compute_effective_window(
+        effective_start, effective_end = self._stay_span(
             admissions_to_process
         )
         time_origin = admissions_to_process[0].timestamp
@@ -831,9 +781,7 @@ class LabsMIMIC4(BaseMultimodalMIMIC4Task):
             lab_times, lab_values, lab_masks = self._collect_labs(
                 patient=patient,
                 admission_time=admission_time,
-                end_time=self._admission_window_end(
-                    admission_time, admission_dischtime
-                ),
+                end_time=admission_dischtime,
                 time_origin=time_origin,
             )
             all_lab_times.extend(lab_times)
@@ -863,11 +811,7 @@ class CXRMIMIC4(BaseMultimodalMIMIC4Task):
     modality the same way ``LabsMIMIC4`` isolates labs.
 
     CXR studies are filtered by timestamp (StudyDate+StudyTime, from the
-    ``metadata`` event table) within each admission's observation window.
-
-    Args:
-        window_hours: Hours from admission to collect CXR studies. ``None``
-            collects for the full admission span. Default: None.
+    ``metadata`` event table) within each admission (admit through discharge).
     """
 
     task_name: str = "CXRMIMIC4"
@@ -891,7 +835,7 @@ class CXRMIMIC4(BaseMultimodalMIMIC4Task):
         if not admissions_to_process:
             return []
 
-        effective_start, effective_end = self._compute_effective_window(
+        effective_start, effective_end = self._stay_span(
             admissions_to_process
         )
         time_origin = admissions_to_process[0].timestamp
@@ -911,9 +855,7 @@ class CXRMIMIC4(BaseMultimodalMIMIC4Task):
             if admission_dischtime < admission_time:
                 admission_dischtime = admission_time
 
-            admission_end = self._admission_window_end(
-                admission_time, admission_dischtime
-            )
+            admission_end = admission_dischtime
 
             # CXR metadata is filtered by timestamp; this includes StudyTime.
             metadata_events = patient.get_events(
