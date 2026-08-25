@@ -48,8 +48,9 @@ def resolve_amp_dtype(amp_dtype: str, use_amp: bool = False) -> torch.dtype:
         and not torch.cuda.is_bf16_supported()
     ):
         raise RuntimeError(
-            "bf16 mixed precision was requested, but this CUDA device does not "
-            "support bf16."
+            "bf16 mixed precision was requested, but this CUDA device "
+            f"({torch.cuda.get_device_name()}) does not support bf16. "
+            "Rerun with --amp-dtype fp16."
         )
     return dtype
 
