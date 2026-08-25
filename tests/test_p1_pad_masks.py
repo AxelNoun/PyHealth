@@ -93,3 +93,46 @@ class TestP1BertPadSkip(unittest.TestCase):
             src = inspect.getsource(cls._build_unified_inputs)
             self.assertIn("PAD_MASK_SUFFIX", src, msg=cls.__name__)
             self.assertIn("pad_mask", src, msg=cls.__name__)
+
+    def test_bottleneck_transformer_forward_is_finite(self):
+        from pyhealth.datasets import create_sample_dataset, get_dataloader
+        from pyhealth.models.bottleneck_transformer import BottleneckTransformer
+
+        samples = [
+            {
+                "patient_id": "patient-0",
+                "visit_id": "visit-0",
+                "conditions": ["A", "B", "C"],
+                "procedures": ["X", "Y"],
+                "label": 1,
+            },
+            {
+                "patient_id": "patient-1",
+                "visit_id": "visit-0",
+                "conditions": ["D"],
+                "procedures": ["Z", "Y"],
+                "label": 0,
+            },
+        ]
+        dataset = create_sample_dataset(
+            samples=samples,
+            input_schema={"conditions": "sequence", "procedures": "sequence"},
+            output_schema={"label": "binary"},
+            dataset_name="bottleneck_forward",
+        )
+        model = BottleneckTransformer(
+            dataset=dataset,
+            embedding_dim=32,
+            bottlenecks_n=2,
+            fusion_startidx=1,
+            num_layers=2,
+            heads=2,
+        )
+        model.eval()
+        batch = next(iter(get_dataloader(dataset, batch_size=2, shuffle=False)))
+        with torch.no_grad():
+            out = model(**batch)
+        logits = out.get("logit", out.get("y_prob"))
+        self.assertTrue(torch.isfinite(logits).all())
+        self.assertEqual(tuple(logits.shape[:1]), (2,))
+
