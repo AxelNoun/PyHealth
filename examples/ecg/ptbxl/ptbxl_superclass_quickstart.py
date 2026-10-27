@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import pandas as pd
+
 from pyhealth.datasets import PTBXLDataset, split_by_strat_fold
 from pyhealth.tasks import PTBXLSuperclassClassification
 
@@ -54,9 +56,20 @@ def main() -> None:
         scp_statements_path=str(args.root / "scp_statements.csv"),
     )
     samples = dataset.set_task(task)
-    # Without ``folds=``, fold values are read through ``samples[i]``, which
-    # decodes every stored sample, signal included, once before splitting.
-    train, val, test = split_by_strat_fold(samples)
+    # Read strat_fold from ptbxl_database.csv and align it with sample indices
+    # through record_to_index, so the split decodes no sample. Row order cannot
+    # be used: set_task drops records with empty label sets.
+    db = pd.read_csv(
+        args.root / "ptbxl_database.csv", usecols=["ecg_id", "strat_fold"]
+    )
+    fold_by_record = {str(int(e)): int(f) for e, f in zip(db.ecg_id, db.strat_fold)}
+    folds: list[int | None] = [None] * len(samples)
+    for record_id, indices in samples.record_to_index.items():
+        for i in indices:
+            folds[i] = fold_by_record[str(record_id)]
+    if None in folds:
+        raise ValueError("some samples have no record_id in ptbxl_database.csv")
+    train, val, test = split_by_strat_fold(samples, folds=folds)
     print(
         f"samples={len(samples)} "
         f"train={len(train)} val={len(val)} test={len(test)}"
